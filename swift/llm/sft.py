@@ -223,11 +223,12 @@ def llm_sft(args: SftArguments) -> str:
         train_dataset = LazyLLMDataset(train_dataset, template)
         val_dataset = LazyLLMDataset(val_dataset, template)
 
+    padding_to = args.max_length if \
+        (args.sft_type == 'longlora' or use_torchacc()) else None
     data_collator = partial(
         data_collate_fn,
         tokenizer=tokenizer,
-        padding_to=args.max_length)
-        # padding_to=args.max_length if args.sft_type == 'longlora' else None)
+        padding_to=padding_to)
     # Setting training_args
     evaluation_strategy = IntervalStrategy.STEPS
     load_best_model_at_end = True
@@ -338,21 +339,25 @@ def llm_sft(args: SftArguments) -> str:
                     indent=2)
     logging_path = os.path.join(args.output_dir, 'logging.jsonl')
     logger.info(f'The logging file will be saved in: {logging_path}')
-    trainer.train(training_args.resume_from_checkpoint)
-    last_model_checkpoint = getattr(trainer.state, 'last_model_checkpoint',
-                                    None)
-    logger.info(f'last_model_checkpoint: {last_model_checkpoint}')
-    logger.info(
-        f'best_model_checkpoint: {trainer.state.best_model_checkpoint}')
-    # Visualization
-    if is_master():
-        images_dir = os.path.join(args.output_dir, 'images')
-        logger.info(f'images_dir: {images_dir}')
-        tb_dir = os.path.join(args.output_dir, 'runs')
-        plot_images(images_dir, tb_dir, ['train/loss'], 0.9)
-        if args.push_to_hub:
-            trainer._add_patterns_to_gitignores(['images/'])
-            trainer.push_to_hub()
+    if not use_torchacc():
+        trainer.train(training_args.resume_from_checkpoint)
+        last_model_checkpoint = getattr(trainer.state, 'last_model_checkpoint',
+                                        None)
+        logger.info(f'last_model_checkpoint: {last_model_checkpoint}')
+        logger.info(
+            f'best_model_checkpoint: {trainer.state.best_model_checkpoint}')
+        # Visualization
+        if is_master():
+            images_dir = os.path.join(args.output_dir, 'images')
+            logger.info(f'images_dir: {images_dir}')
+            tb_dir = os.path.join(args.output_dir, 'runs')
+            plot_images(images_dir, tb_dir, ['train/loss'], 0.9)
+            if args.push_to_hub:
+                trainer._add_patterns_to_gitignores(['images/'])
+                trainer.push_to_hub()
+    else:
+        last_model_checkpoint = None
+        trainer.train()
     return {
         'last_model_checkpoint': last_model_checkpoint,
         'best_model_checkpoint': trainer.state.best_model_checkpoint,
