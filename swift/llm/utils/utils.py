@@ -38,7 +38,8 @@ from transformers import (GenerationConfig, PreTrainedModel,
 
 from swift.hub import ModelScopeConfig
 from swift.utils import (get_dist_setting, get_logger, is_ddp_plus_mp, is_dist,
-                         is_local_master, is_master, stat_array, upper_bound)
+                         is_local_master, is_master, stat_array, upper_bound,
+                         use_torchacc)
 from .template import History, StopWordsCriteria, Template, get_audio_info
 
 logger = get_logger()
@@ -677,6 +678,8 @@ if is_ddp_plus_mp():
         _old_ddp_init(self, model, *args, **kwargs))
     transformers.modeling_utils.get_balanced_memory = lambda *args, **kwargs: None
     transformers.modeling_utils.infer_auto_device_map = _infer_auto_device_map_patch
+
+if is_ddp_plus_mp() or use_torchacc():
     _old_accelerator_init = trainer.Accelerator.__init__
     trainer.Accelerator.__init__ = (
         lambda self, device_placement=False, *args, **kwargs:

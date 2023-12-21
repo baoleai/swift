@@ -16,7 +16,8 @@ from swift.utils import (check_json_format, compute_acc_metrics,
                          get_dist_setting, get_logger, get_model_info,
                          is_ddp_plus_mp, is_dist, is_master, plot_images,
                          preprocess_logits_for_metrics, seed_everything,
-                         show_layers)
+                         show_layers, torchacc_patch_accelerate,
+                         torchacc_patch_transformers, use_torchacc)
 from .utils import (LazyLLMDataset, SftArguments, Template,
                     add_self_cognition_dataset, data_collate_fn, dataset_map,
                     find_all_linear_for_lora, fix_fp16_trainable_bug,
@@ -39,7 +40,7 @@ def llm_sft(args: SftArguments) -> str:
     model_kwargs = {'low_cpu_mem_usage': True}
     if is_dist() and not is_ddp_plus_mp():
         model_kwargs['device_map'] = {'': local_rank}
-    else:
+    elif not use_torchacc():
         model_kwargs['device_map'] = 'auto'
     if args.load_in_8bit or args.load_in_4bit:
         quantization_config = BitsAndBytesConfig(
@@ -56,6 +57,7 @@ def llm_sft(args: SftArguments) -> str:
         kwargs['use_flash_attn'] = args.use_flash_attn
     if args.model_cache_dir is not None:
         kwargs['model_dir'] = args.model_cache_dir
+
     model, tokenizer = get_model_tokenizer(args.model_type, args.torch_dtype,
                                            model_kwargs, **kwargs)
     logger.info(f'model_config: {model.config}')
@@ -95,6 +97,32 @@ def llm_sft(args: SftArguments) -> str:
                     **lora_kwargs)
                 model = Swift.prepare_model(model, lora_config)
                 logger.info(f'lora_config: {lora_config}')
+
+                if use_torchacc():
+                    import torchacc as ta
+                    torchacc_patch_accelerate()
+                    torchacc_patch_transformers()
+                    ## patch qwen for torchacc flash_attention
+                    os.system('cp modeling_qwen.py /root/.cache/modelscope/hub/qwen/Qwen-72B-Chat/modeling_qwen.py')
+                    def get_ta_config():
+                        config = ta.Config()
+                        config.compute.fp16 = False
+                        config.compute.bf16 = True
+
+                        config.memory.gc = True
+                        if config.memory.gc:
+                            config.memory.gc_cls = {"QWenBlock"}
+
+                        config.dist.fsdp.size = 2
+                        config.dist.fsdp.wrap_layer_cls = {"QWenBlock"}
+                        config.dist.fsdp.flatten_parameters = False
+
+                        return config
+
+                    ta_config = get_ta_config()
+                    model = ta.accelerate(model, ta_config)
+
+
             elif args.sft_type == 'longlora':
                 assert args.tuner_backend != 'peft'
                 assert LongLoRAModelType.LLAMA in args.model_type
@@ -198,7 +226,8 @@ def llm_sft(args: SftArguments) -> str:
     data_collator = partial(
         data_collate_fn,
         tokenizer=tokenizer,
-        padding_to=args.max_length if args.sft_type == 'longlora' else None)
+        padding_to=args.max_length)
+        # padding_to=args.max_length if args.sft_type == 'longlora' else None)
     # Setting training_args
     evaluation_strategy = IntervalStrategy.STEPS
     load_best_model_at_end = True
@@ -244,7 +273,7 @@ def llm_sft(args: SftArguments) -> str:
         push_to_hub=args.push_to_hub,
         resume_from_checkpoint=args.resume_from_checkpoint,
         ddp_backend=args.ddp_backend,
-        gradient_checkpointing=args.gradient_checkpointing,
+        gradient_checkpointing=False if use_torchacc() else args.gradient_checkpointing,
         predict_with_generate=args.predict_with_generate,
         generation_config=generation_config,
         local_rank=local_rank,
@@ -257,7 +286,7 @@ def llm_sft(args: SftArguments) -> str:
         save_on_each_node=args.save_on_each_node,
         acc_strategy=args.acc_strategy)
 
-    if args.gradient_checkpointing:
+    if args.gradient_checkpointing and not use_torchacc():
         model.config.use_cache = False  # fix transformers==4.36
         logger.info('Setting model.config.use_cache: False')
         model.enable_input_require_grads()

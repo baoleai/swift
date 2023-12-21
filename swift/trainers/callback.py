@@ -9,7 +9,7 @@ from transformers.trainer_callback import (DefaultFlowCallback,
 from transformers.trainer_utils import IntervalStrategy, has_length
 
 from swift.trainers import TrainingArguments
-
+from swift.utils import use_torchacc
 
 class ProgressCallbackNew(ProgressCallback):
 
@@ -40,6 +40,9 @@ class ProgressCallbackNew(ProgressCallback):
         for k, v in logs.items():
             if isinstance(v, float):
                 logs[k] = round(logs[k], 8)
+        if use_torchacc():
+            logs['loss'] = 0.0
+            logs['acc'] = 0.0
         if state.is_local_process_zero and self.training_bar is not None:
             jsonl_path = os.path.join(args.output_dir, 'logging.jsonl')
             with open(jsonl_path, 'a', encoding='utf-8') as f:
