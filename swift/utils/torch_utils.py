@@ -46,8 +46,6 @@ def torchacc_patch_accelerate():
     _func_check_and_set(accelerate.state, 'is_tpu_available', RETURN_TRUE)
 
 def torchacc_patch_transformers():
-    # return true in is_tpu_available to enable torch_xla fsdp.
-    _func_check_and_set(transformers, 'is_torch_tpu_available', RETURN_TRUE)
     # tensorboard does not support nested json format which used in fsdp
     _func_check_and_set(transformers.integrations.integration_utils,
                         'is_tensorboard_available', RETURN_FALSE)

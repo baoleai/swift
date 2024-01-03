@@ -16,8 +16,10 @@ from swift.utils import (check_json_format, compute_acc_metrics,
                          get_dist_setting, get_logger, get_model_info,
                          is_ddp_plus_mp, is_dist, is_master, plot_images,
                          preprocess_logits_for_metrics, seed_everything,
-                         show_layers, torchacc_patch_accelerate,
-                         torchacc_patch_transformers, use_torchacc)
+                         show_layers,
+                         torchacc_patch_accelerate,
+                         torchacc_patch_transformers,
+                         use_torchacc)
 from .utils import (LazyLLMDataset, SftArguments, Template,
                     add_self_cognition_dataset, data_collate_fn, dataset_map,
                     find_all_linear_for_lora, fix_fp16_trainable_bug,
@@ -26,7 +28,6 @@ from .utils import (LazyLLMDataset, SftArguments, Template,
                     set_generation_config, sort_by_max_length, stat_dataset)
 
 logger = get_logger()
-
 
 def llm_sft(args: SftArguments) -> str:
     logger.info(f'args: {args}')
@@ -97,32 +98,6 @@ def llm_sft(args: SftArguments) -> str:
                     **lora_kwargs)
                 model = Swift.prepare_model(model, lora_config)
                 logger.info(f'lora_config: {lora_config}')
-
-                if use_torchacc():
-                    import torchacc as ta
-                    torchacc_patch_accelerate()
-                    torchacc_patch_transformers()
-                    ## patch qwen for torchacc flash_attention
-                    os.system('cp modeling_qwen.py /root/.cache/modelscope/hub/qwen/Qwen-72B-Chat/modeling_qwen.py')
-                    def get_ta_config():
-                        config = ta.Config()
-                        config.compute.fp16 = False
-                        config.compute.bf16 = True
-
-                        config.memory.gc = True
-                        if config.memory.gc:
-                            config.memory.gc_cls = {"QWenBlock"}
-
-                        config.dist.fsdp.size = 2
-                        config.dist.fsdp.wrap_layer_cls = {"QWenBlock"}
-                        config.dist.fsdp.flatten_parameters = False
-
-                        return config
-
-                    ta_config = get_ta_config()
-                    model = ta.accelerate(model, ta_config)
-
-
             elif args.sft_type == 'longlora':
                 assert args.tuner_backend != 'peft'
                 assert LongLoRAModelType.LLAMA in args.model_type
@@ -168,6 +143,32 @@ def llm_sft(args: SftArguments) -> str:
     model_info = get_model_info(model)
     logger.info(model_info)
     logger.info(model)
+
+    if use_torchacc():
+        import torchacc as ta
+        torchacc_patch_accelerate()
+        torchacc_patch_transformers()
+        ## patch qwen for torchacc flash_attention
+        os.system('cp modeling_qwen.py /root/.cache/modelscope/hub/qwen/Qwen-72B-Chat/modeling_qwen.py')
+
+        def get_ta_config():
+            config = ta.Config()
+            config.compute.fp16 = False
+            config.compute.bf16 = True
+
+            config.memory.gc = True
+            if config.memory.gc:
+                config.memory.gc_cls = {"QWenBlock"}
+
+            config.dist.fsdp.size = 2
+            config.dist.fsdp.wrap_layer_cls = {"QWenBlock"}
+            config.dist.fsdp.flatten_parameters = False
+
+            return config
+
+        ta_config = get_ta_config()
+        model = ta.accelerate(model, ta_config)
+
 
     # Loading Dataset
     random_state = np.random.RandomState(args.dataset_seed)
@@ -223,8 +224,10 @@ def llm_sft(args: SftArguments) -> str:
         train_dataset = LazyLLMDataset(train_dataset, template)
         val_dataset = LazyLLMDataset(val_dataset, template)
 
-    padding_to = args.max_length if \
-        (args.sft_type == 'longlora' or use_torchacc()) else None
+
+    # padding_to = args.max_length
+    padding_to = args.max_length if args.sft_type == 'longlora' else None
+
     data_collator = partial(
         data_collate_fn,
         tokenizer=tokenizer,
@@ -261,6 +264,7 @@ def llm_sft(args: SftArguments) -> str:
         fp16=args.fp16,
         eval_steps=args.eval_steps,
         dataloader_num_workers=args.dataloader_num_workers,
+        dataloader_pin_memory=False,
         load_best_model_at_end=load_best_model_at_end,
         metric_for_best_model='rouge-l'
         if args.predict_with_generate else 'loss',

@@ -1,4 +1,4 @@
-CUDA_VISIBLE_DEVICES=4,5 \
+CUDA_VISIBLE_DEVICES=6,7 \
 swift sft \
 	--model_type qwen-72b-chat \
 	--dataset codefuse-python-en \
