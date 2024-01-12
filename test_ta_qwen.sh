@@ -12,8 +12,7 @@ export XLA_ALLOCATOR_FRACTION=0.97
 MASTER_ADDR=127.0.0.1 \
 MASTER_PORT=9010 \
 NPROC_PER_NODE=2 \
-XLA_IR_DEBUG=1 XLA_HLO_DEBUG=1 \
-CUDA_VISIBLE_DEVICES=6,7 \
+CUDA_VISIBLE_DEVICES=0,1 \
 swift sft \
 	--model_type qwen-72b-chat \
 	--dataset codefuse-python-en \
