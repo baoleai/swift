@@ -37,6 +37,13 @@ def llm_sft(args: SftArguments) -> str:
           f'world_size: {world_size}, local_world_size: {local_world_size}')
     seed_everything(args.seed)
 
+    if use_torchacc():
+        import torchacc as ta
+        torchacc_patch_accelerate()
+        torchacc_patch_transformers()
+        ## patch qwen for torchacc flash_attention
+        os.system('cp modeling_qwen.py /root/.cache/modelscope/hub/qwen/Qwen-72B-Chat/modeling_qwen.py')
+
     # Loading Model and Tokenizer
     model_kwargs = {'low_cpu_mem_usage': True}
     if is_dist() and not is_ddp_plus_mp():
@@ -146,10 +153,6 @@ def llm_sft(args: SftArguments) -> str:
 
     if use_torchacc():
         import torchacc as ta
-        torchacc_patch_accelerate()
-        torchacc_patch_transformers()
-        ## patch qwen for torchacc flash_attention
-        os.system('cp modeling_qwen.py /root/.cache/modelscope/hub/qwen/Qwen-72B-Chat/modeling_qwen.py')
 
         def get_ta_config():
             config = ta.Config()
@@ -162,7 +165,7 @@ def llm_sft(args: SftArguments) -> str:
 
             config.dist.fsdp.size = 2
             config.dist.fsdp.wrap_layer_cls = {"QWenBlock"}
-            config.dist.fsdp.flatten_parameters = False
+            config.dist.fsdp.flatten_parameters = True
 
             return config
 
