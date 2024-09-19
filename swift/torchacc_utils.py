@@ -1,6 +1,10 @@
 # Copyright (c) Alibaba, Inc. and its affiliates.
+import importlib
+import inspect
 import os
+import re
 import sys
+import textwrap
 import types
 from collections import OrderedDict
 from typing import List, Optional, Tuple
@@ -332,7 +336,7 @@ def patch_acc_model(model, args):
         model = patch_qwen2_model(model)
     elif args.model_type.startswith('qwen'):
         import torchacc as ta
-        model = ta.patch_qwen_model(model)
+        model = patch_qwen_model(model)
     elif args.model_type.startswith('baichuan'):
         model = patch_baichuan_model(model)
     elif args.model_type.startswith('llama') or args.model_type.startswith('yi'):
@@ -345,8 +349,7 @@ def patch_acc_model(model, args):
 def patch_llama_model(model):
 
     def update_causal_mask(self, *args, **kwargs):
-        # attention_mask is not supported in TorchAcc.
-        return None
+        return args[0]
 
     def llama_attn_forward(self,
                            hidden_states: torch.Tensor,
@@ -388,14 +391,10 @@ def patch_llama_model(model):
         # See https://github.com/HazyResearch/flash-attention/blob/main/flash_attn/flash_attention.py
         # if attention_mask is not None:
         #     value_states = value_states * attention_mask.unsqueeze(1).unsqueeze(-1)
-        q = einops.rearrange(query_states, 'b h s ... -> (b s) h ...')
-        k = einops.rearrange(key_states, 'b h s ... -> (b s) h ...')
-        v = einops.rearrange(value_states, 'b h s ... -> (b s) h ...')
-        max_s = q_len
-        cu_q_lens = torch.arange(0, (bsz + 1) * q_len, step=q_len, dtype=torch.int32, device=q.device)
-        output = flash_attn_varlen_xla(
-            q, k, v, cu_q_lens, cu_q_lens, max_s, max_s, 0.0, softmax_scale=None, causal=True)
-        output = einops.rearrange(output, '(b s) ... -> b s ...', b=bsz)
+        q = einops.rearrange(query_states, 'b h s ... -> b s h ...')
+        k = einops.rearrange(key_states, 'b h s ... -> b s h ...')
+        v = einops.rearrange(value_states, 'b h s ... -> b s h ...')
+        output = flash_attn_varlen_xla(q, k, v, attention_mask.to(torch.int32), 0.0, softmax_scale=None, causal=True)
 
         return self.o_proj(einops.rearrange(output, 'b s h d -> b s (h d)')), None, past_key_value
 
@@ -503,18 +502,11 @@ def patah_chatglm_model(model):
         # core attention computation
         # ==================================
 
-        from torchacc.ops import flash_attn_varlen_qkvpacked_xla
-        import einops
+        from torchacc.ops import flash_attn_xla
 
-        query_layer, key_layer, value_layer = [k.permute(1, 2, 0, 3) for k in [query_layer, key_layer, value_layer]]
-        bsz, _, q_len, _ = query_layer.size()
-        qkv = torch.stack([query_layer, key_layer, value_layer], dim=2)
-        qkv = qkv.transpose(1, 3)
-        qkv = einops.rearrange(qkv, 'b s ... -> (b s) ...')
-        cu_q_lens = torch.arange(0, (bsz + 1) * q_len, step=q_len, dtype=torch.int32, device=qkv.device)
-        context_layer = flash_attn_varlen_qkvpacked_xla(
-            qkv, cu_q_lens, q_len, dropout_p=0.0, softmax_scale=None, causal=True)
-        context_layer = einops.rearrange(context_layer, '(b s) ... -> b s ...', b=bsz)
+        query_layer, key_layer, value_layer = [k.permute(1, 0, 2, 3) for k in [query_layer, key_layer, value_layer]]
+        context_layer = flash_attn_xla(
+            query_layer, key_layer, value_layer, dropout_p=0.0, softmax_scale=None, causal=True)
         context_layer = context_layer.permute(1, 0, 2, 3)
         new_context_layer_shape = context_layer.size()[:-2] + (self.core_attention.hidden_size_per_partition, )
         context_layer = context_layer.reshape(*new_context_layer_shape)
@@ -570,21 +562,68 @@ def patch_baichuan_model(model):
 
         past_key_value = (key_states, value_states) if use_cache else None
 
-        from torchacc.ops import flash_attn_varlen_xla
+        from torchacc.ops import flash_attn_xla
         query_states = query_states.transpose(1, 2)
         key_states = key_states.transpose(1, 2)
         value_states = value_states.transpose(1, 2)
-        q, k, v = [einops.rearrange(x, 'b s ... -> (b s) ...') for x in [query_states, key_states, value_states]]
-        cu_q_lens = torch.arange(0, (bsz + 1) * q_len, step=q_len, dtype=torch.int32, device=q.device)
-        output = flash_attn_varlen_xla(
-            q, k, v, cu_q_lens, cu_q_lens, q_len, q_len, 0.0, softmax_scale=None, causal=True)
-        output = einops.rearrange(output, '(b s) ... -> b s ...', b=bsz)
+        output = flash_attn_xla(query_states, key_states, value_states, 0.0, softmax_scale=None, causal=True)
         output = self.o_proj(einops.rearrange(output, 'b s h d -> b s (h d)'))
         return output, None, past_key_value
 
     for layer in model.base_model.layers:
         layer.self_attn.forward = types.MethodType(baichuan_attn_forward, layer.self_attn)
 
+    return model
+
+
+def patch_qwen_model(model):
+
+    def rewrite_forward(instance, func_name):
+        """Remove dtype and cuda check in Qwen transformer.h.attn.forward and
+        transformer.h.attn.core_attention_flash.forward"""
+        # get path of modeling_qwen.py
+        module_path = 'transformers_modules/Qwen-72B-Chat/modeling_qwen'
+        module_path = module_path.replace(os.path.sep, '.')
+        module = importlib.import_module(module_path)
+
+        source = inspect.getsource(getattr(instance, func_name))
+        # Remove checks in FlashSelfAttention forward that are
+        # incompatible with torchacc.
+        # remove dtype assert, cause there could be float32 type of weight when we
+        # use AMP training.
+        new_source = re.sub(r'assert all\(\(i\.dtype in \[torch\.float16, torch\.bfloat16\] for i in \(q, k, v\)\)\)',
+                            r'pass', source)
+        # remove cuda device check because it is xla not cuda when we use TorchAcc.
+        new_source = re.sub(r'(assert all\(\(i.is_cuda for i in \(q, k, v\)\)\))', r'pass', new_source)
+        # remove batch_size > 1 check to avoid introducing dynamic shape.
+        new_source = re.sub(r'batch_size > 1', r'False', new_source)
+
+        # Remove dtype and device check in QWenAttention forward.
+        new_source = re.sub(r'self\.is_fp32', r'False', new_source)
+        new_source = re.sub(r'query\.is_cuda', r'True', new_source)
+        # replace flash attention
+        pattern = r'flash_attn_unpadded_func\(\s*q,\s*k,\s*v,\s*cu_seqlens_q,\
+        \s*cu_seqlens_k,\s*seqlen_q,\s*seqlen_k,\s*dropout_p,\s*softmax_scale=\
+        self.softmax_scale,\s*causal=is_causal,\s*\)'
+
+        replacement = 'flash_attn_varlen_xla(q,k,v,attention_mask,dropout_p,\
+        softmax_scale=self.softmax_scale,causal=is_causal,)'
+
+        new_source = re.sub(pattern, replacement, new_source)
+        new_source = textwrap.dedent(new_source)
+
+        # import torchacc
+        torchacc = importlib.import_module('torchacc')
+        module.__dict__['torchacc'] = torchacc
+
+        # replace forward with modified one.
+        exec(new_source, module.__dict__)
+        new_function = types.MethodType(module.__dict__[func_name], instance)
+        setattr(instance, func_name, new_function)
+
+    for layer in model.transformer.h:
+        rewrite_forward(layer.attn, 'forward')
+        rewrite_forward(layer.attn.core_attention_flash, 'forward')
     return model
 
 
@@ -652,13 +691,16 @@ def patch_qwen2_model(model):
         value_states = value_states.transpose(1, 2)
 
         from torchacc.ops import flash_attn_varlen_xla
-        import einops
 
-        q, k, v = [einops.rearrange(x, 'b s ... -> (b s) ...') for x in [query_states, key_states, value_states]]
-        cu_q_lens = torch.arange(0, (bsz + 1) * q_len, step=q_len, dtype=torch.int32, device=q.device)
-
+        attention_mask = attention_mask.reshape(bsz, q_len)
         attn_output = flash_attn_varlen_xla(
-            q, k, v, cu_q_lens, cu_q_lens, q_len, q_len, dropout_rate, softmax_scale=None, causal=True)
+            query_states,
+            key_states,
+            value_states,
+            attention_mask.to(torch.int32),
+            dropout_rate,
+            softmax_scale=None,
+            causal=True)
 
         attn_output = attn_output.reshape(bsz, q_len, self.hidden_size).contiguous()
         attn_output = self.o_proj(attn_output)
